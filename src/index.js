@@ -2,6 +2,79 @@ import { chromium } from 'playwright';
 import pixelmatch from 'pixelmatch';
 import fs from 'fs-extra';
 const { writeFile, ensureDir, readFile } = fs;
+import { basename } from 'path';
+
+// Helper functions for path-based naming
+function sanitizePathComponent(url) {
+  try {
+    const urlObj = new URL(url);
+    const path = urlObj.pathname + urlObj.hash;
+    // Create a short hash of the path
+    const hash = Array.from(path).reduce((h, c) => 
+      (((h << 5) - h) + c.charCodeAt(0)) | 0, 0
+    ).toString(36).slice(-6);
+    
+    // Get the last part of the path
+    const lastPart = path === '/' ? 'home' : 
+                    basename(path).replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'page';
+    
+    return `${lastPart}_${hash}`;
+  } catch (err) {
+    return `page_${Date.now().toString(36)}`;
+  }
+}
+
+function isAnchorLink(url) {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hash !== '' && urlObj.pathname === new URL(urlObj.origin).pathname;
+  } catch {
+    return false;
+  }
+}
+
+function isSimilarPath(urlA, urlB) {
+  try {
+    const urlObjA = new URL(urlA);
+    const urlObjB = new URL(urlB);
+    // For anchor links, compare full URL including hash
+    if (isAnchorLink(urlA) || isAnchorLink(urlB)) {
+      return urlA === urlB;
+    }
+    // For regular links, compare just the pathname
+    return urlObjA.pathname === urlObjB.pathname;
+  } catch {
+    return false;
+  }
+}
+
+async function captureScreenshot(page, dir, filename) {
+  if (!page) return null;
+  
+  try {
+    const screenshotPath = path.join(dir, filename);
+    await page.screenshot({ 
+      path: screenshotPath,
+      fullPage: true 
+    });
+    return screenshotPath;
+  } catch (err) {
+    console.error(`Error capturing screenshot ${filename}:`, err.message);
+    return null;
+  }
+}
+
+async function getPageLinks(page, baseUrl) {
+  if (!page) return [];
+  
+  try {
+    const links = await page.$$eval('a', (anchors) => anchors.map((a) => a.href));
+    return links.filter(link => isSameDomain(baseUrl, link));
+  } catch (err) {
+    console.error('Error getting page links:', err.message);
+    return [];
+  }
+}
 import path from 'path';
 import PNG from 'pngjs';
 import { spawn } from 'child_process';
@@ -18,10 +91,35 @@ import builder from 'junit-report-builder';
 const report = builder.newBuilder();
 
 // Helper function to check if URLs are in the same domain
+function isTraversableUrl(url) {
+  try {
+    if (!url || typeof url !== 'string') return false;
+    
+    // Skip these URL types
+    if (url.startsWith('mailto:')) return false;
+    if (url.startsWith('tel:')) return false;
+    if (url.startsWith('sms:')) return false;
+    if (url.startsWith('javascript:')) return false;
+    if (url.startsWith('data:')) return false;
+    if (url.startsWith('file:')) return false;
+    if (url.startsWith('ftp:')) return false;
+    if (url.endsWith('.pdf')) return false;
+    if (url.endsWith('.zip')) return false;
+    if (url.endsWith('.doc')) return false;
+    if (url.endsWith('.docx')) return false;
+    if (url.endsWith('.xls')) return false;
+    if (url.endsWith('.xlsx')) return false;
+    
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isSameDomain(baseUrl, targetUrl) {
   try {
-    // Skip empty or invalid URLs
-    if (!targetUrl || typeof targetUrl !== 'string') {
+    // Skip empty, invalid, or non-traversable URLs
+    if (!isTraversableUrl(targetUrl)) {
       return false;
     }
     
@@ -45,70 +143,125 @@ function isSameDomain(baseUrl, targetUrl) {
 }
 
 // Depth-first traversal function
-async function dfs(page, url, screenshotDir, visited = new Set(), screenshots = []) {
-  if (visited.has(url)) return;
-  visited.add(url);
-
-  try {
-    // Navigate and wait for full page load
-    await page.goto(url, { 
-      waitUntil: 'networkidle'
-    });
-
-    // Wait for animations and dynamic content
-    await page.waitForLoadState('load');
-    await page.waitForTimeout(1000); // Wait for any animations
-    
-    // Wait for common loading indicators to disappear
-    await Promise.all([
-      page.waitForSelector('.loading', { state: 'hidden', timeout: 5000 }).catch(() => {}),
-      page.waitForSelector('.spinner', { state: 'hidden', timeout: 5000 }).catch(() => {}),
-      page.waitForSelector('[role="progressbar"]', { state: 'hidden', timeout: 5000 }).catch(() => {})
-    ]);
-
-    const screenshotPath = path.join(screenshotDir, `${visited.size}.png`);
-    await page.screenshot({ 
-      path: screenshotPath,
-      fullPage: true 
-    });
-    
-    // Verify screenshot was created
-    if (await fs.pathExists(screenshotPath)) {
-      screenshots.push(screenshotPath);
-      console.log(`Screenshot captured: ${screenshotPath}`);
-    } else {
-      console.error(`Failed to capture screenshot for URL: ${url}`);
-    }
-  } catch (err) {
-    console.error(`Error capturing screenshot for ${url}:`, err.message);
+async function dfs(pageA, pageB, urlA, urlB, depth = 0, visitedA = new Set(), visitedB = new Set(), screenshots = { a: [], b: [] }) {
+  // Limit depth to prevent infinite loops
+  const MAX_DEPTH = 10;
+  if (depth >= MAX_DEPTH) {
+    console.log(`Max depth ${MAX_DEPTH} reached, stopping traversal`);
+    return { visitedA, visitedB, screenshots };
   }
+  // Normalize URLs before checking visited state
+  const normalizedA = urlA ? new URL(urlA).toString() : null;
+  const normalizedB = urlB ? new URL(urlB).toString() : null;
 
-  const links = await page.$$eval('a', (anchors) => anchors.map((a) => a.href));
+  if ((normalizedA && visitedA.has(normalizedA)) || 
+      (normalizedB && visitedB.has(normalizedB))) {
+    return { visitedA, visitedB, screenshots };
+  }
   
-  // Filter links to only include valid HTTP(S) same-domain URLs
-  const internalLinks = links.filter(link => {
+  if (pageA && normalizedA) {
+    visitedA.add(normalizedA);
     try {
-      if (!link || typeof link !== 'string') return false;
-      
-      // Skip non-HTTP protocols
-      if (link.startsWith('mailto:') || 
-          link.startsWith('tel:') ||
-          link.startsWith('javascript:')) {
-        return false;
-      }
-
-      return isSameDomain(url, link);
+      await pageA.goto(urlA, { waitUntil: 'networkidle' });
+      await pageA.waitForLoadState('load');
+      await pageA.waitForTimeout(1000);
+      await Promise.all([
+        pageA.waitForSelector('.loading', { state: 'hidden', timeout: 5000 }).catch(() => {}),
+        pageA.waitForSelector('.spinner', { state: 'hidden', timeout: 5000 }).catch(() => {}),
+        pageA.waitForSelector('[role="progressbar"]', { state: 'hidden', timeout: 5000 }).catch(() => {})
+      ]);
     } catch (err) {
-      console.error('Error filtering link:', err.message);
-      return false;
+      console.error(`Error navigating to ${urlA}:`, err.message);
     }
-  });
-  
-  for (const link of internalLinks) {
-    await dfs(page, link, screenshotDir, visited, screenshots);
   }
 
-  return { visited, screenshots };
+  if (pageB && normalizedB) {
+    visitedB.add(normalizedB);
+    try {
+      await pageB.goto(urlB, { waitUntil: 'networkidle' });
+      await pageB.waitForLoadState('load');
+      await pageB.waitForTimeout(1000);
+      await Promise.all([
+        pageB.waitForSelector('.loading', { state: 'hidden', timeout: 5000 }).catch(() => {}),
+        pageB.waitForSelector('.spinner', { state: 'hidden', timeout: 5000 }).catch(() => {}),
+        pageB.waitForSelector('[role="progressbar"]', { state: 'hidden', timeout: 5000 }).catch(() => {})
+      ]);
+    } catch (err) {
+      console.error(`Error navigating to ${urlB}:`, err.message);
+    }
+  }
+
+  // Take screenshots with matching names
+  const screenshotName = `${sanitizePathComponent(urlA || urlB)}.png`;
+  const screenshotA = await captureScreenshot(pageA, screenshotDirA, screenshotName);
+  const screenshotB = await captureScreenshot(pageB, screenshotDirB, screenshotName);
+  
+  if (screenshotA) screenshots.a.push(screenshotA);
+  if (screenshotB) screenshots.b.push(screenshotB);
+
+  // Get and normalize links from both pages
+  const linksA = (await getPageLinks(pageA, urlA)).map(url => {
+    try {
+      return new URL(url).toString();
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  
+  const linksB = (await getPageLinks(pageB, urlB)).map(url => {
+    try {
+      return new URL(url).toString();
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+
+  // If current URL is an anchor link, don't traverse further
+  if (urlA && isAnchorLink(urlA) || urlB && isAnchorLink(urlB)) {
+    return { visitedA, visitedB, screenshots };
+  }
+
+  // Filter out already visited links and find common ones
+  const commonLinks = linksA.filter(linkA => 
+    !visitedA.has(linkA) && 
+    linksB.some(linkB => !visitedB.has(linkB) && isSimilarPath(linkA, linkB))
+  );
+
+  // Process common links first to maintain alignment
+  for (const linkA of commonLinks) {
+    const linkB = linksB.find(b => isSimilarPath(linkA, b));
+    await dfs(
+      pageA, pageB,
+      linkA, linkB,
+      depth + 1,
+      visitedA, visitedB,
+      screenshots
+    );
+  }
+
+  // Process unique links in A
+  for (const linkA of linksA.filter(a => !commonLinks.includes(a))) {
+    await dfs(
+      pageA, null,
+      linkA, null,
+      depth + 1,
+      visitedA, visitedB,
+      screenshots
+    );
+  }
+
+  // Process unique links in B
+  for (const linkB of linksB.filter(b => !commonLinks.some(a => isSimilarPath(a, b)))) {
+    await dfs(
+      null, pageB,
+      null, linkB,
+      depth + 1,
+      visitedA, visitedB,
+      screenshots
+    );
+  }
+
+  return { visitedA, visitedB, screenshots };
 }
 
 // Compare screenshots using pixelmatch
@@ -164,9 +317,15 @@ async function runVisualRegression(instanceA, instanceB) {
   await ensureDir(screenshotDirA);
   await ensureDir(screenshotDirB);
 
-  // Perform DFS on both instances
-  const { visited: visitedA, screenshots: screenshotsA } = await dfs(pageA, instanceA, screenshotDirA);
-  const { visited: visitedB, screenshots: screenshotsB } = await dfs(pageB, instanceB, screenshotDirB);
+  // Perform DFS on both instances simultaneously
+  const { visitedA, visitedB, screenshots } = await dfs(
+    pageA, pageB,
+    instanceA, instanceB,
+    0 // Initial depth
+  );
+  
+  const screenshotsA = screenshots.a;
+  const screenshotsB = screenshots.b;
 
   // Compare graph structures
   const addedUrls = [...visitedB].filter((url) => !visitedA.has(url));
